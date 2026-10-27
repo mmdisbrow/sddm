@@ -242,8 +242,19 @@ namespace SDDM {
         SafeDataStream str(m_socket);
         str << Msg::AUTHENTICATED << user;
         str.send();
-        if (user.isEmpty())
+        if (user.isEmpty()) {
+            m_authenticationApproved = false;
+            if (m_parallelProtocol) {
+                // Keep the embedded peer alive until the daemon has checked
+                // its identity and consumed the failed result. A fast PAM
+                // denial must not disappear before the hello is accepted.
+                str.receive();
+                str >> m;
+                if (m != AUTHENTICATED || str.status() != QDataStream::Ok)
+                    qWarning() << "Invalid failed-authentication acknowledgement";
+            }
             return env;
+        }
         str.receive();
         bool approved = !m_parallelProtocol;
         m_authenticationApproved = false;

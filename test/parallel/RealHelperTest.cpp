@@ -105,8 +105,19 @@ class RealHelperTest : public QObject {
             } else if (msg == AUTHENTICATED) {
                 QString user;
                 stream >> user;
-                if (user.isEmpty())
+                if (user.isEmpty()) {
+                    if (parallel) {
+                        // A fast failure stays alive for identity verification
+                        // and result delivery, but no reply can approve it.
+                        QTest::qWait(100);
+                        QCOMPARE(process.state(), QProcess::Running);
+                        stream.reset();
+                        stream << (malformed ? REQUEST : AUTHENTICATED);
+                        stream << true << QProcessEnvironment() << QByteArray();
+                        stream.send();
+                    }
                     break;
+                }
                 authenticated = true;
                 QProcessEnvironment env;
                 env.insert(QStringLiteral("PATH"), QStringLiteral("/usr/bin:/bin"));
@@ -154,6 +165,12 @@ class RealHelperTest : public QObject {
     }
     void accountRejectionCannotReachSession() {
         trial(true, true);
+    }
+    void malformedFailureAcknowledgementCannotReachSession() {
+        trial(true, true, true);
+    }
+    void legacyDenialNeedsNoAcknowledgement() {
+        trial(true, true, false, false);
     }
 };
 int main(int argc, char **argv) {

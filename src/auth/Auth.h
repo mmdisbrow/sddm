@@ -95,6 +95,7 @@ namespace SDDM {
         bool autologin() const;
         bool fingerprint() const;
         bool parallelAttempt() const;
+        bool cancelled() const;
         void setFingerprint(bool enabled);
         void setPasswordOnly(bool enabled);
         // Called synchronously from authentication() before session approval.

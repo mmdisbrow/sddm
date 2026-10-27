@@ -38,8 +38,11 @@ int main(int argc, char **argv) {
     if (fields[0] == QStringLiteral("display-fixture") && fields.size() == 5) {
         const bool fp = args.contains(QStringLiteral("--fingerprint"));
         delay = fields[fp ? 2 : 1].toInt();
-        mode = fp ? (fields[3] == QStringLiteral("password-fail") ? QStringLiteral("ok") : fields[3]) :
-                    (fields[3] == QStringLiteral("password-fail") ? QStringLiteral("fail") : QStringLiteral("ok"));
+        const bool failPassword = fields[3] == QStringLiteral("password-fail") ||
+                                  fields[3] == QStringLiteral("password-fail-disconnect");
+        mode = fp ? (failPassword ? QStringLiteral("ok") : fields[3]) :
+                    (fields[3] == QStringLiteral("password-fail-disconnect") ? QStringLiteral("fail-disconnect") :
+                     failPassword ? QStringLiteral("fail") : QStringLiteral("ok"));
         proof = fields[4] + (fp ? QStringLiteral("-fp") : QStringLiteral("-pw"));
     }
     if (mode == QStringLiteral("ignore-term"))
@@ -86,10 +89,52 @@ int main(int argc, char **argv) {
                 app.exit(1);
                 return;
             }
-            out << AUTHENTICATED << (mode == QStringLiteral("fail") ? QString() : arg(QStringLiteral("--user")));
+            const bool failed = mode == QStringLiteral("fail") || mode.startsWith(QStringLiteral("fail-"));
+            out << AUTHENTICATED << (failed ? QString() : arg(QStringLiteral("--user")));
             out.send();
-            if (mode == QStringLiteral("fail")) {
-                app.exit(1);
+            if (failed) {
+                if (parallel && !mode.startsWith(QStringLiteral("fail-disconnect"))) {
+                    out.receive();
+                    Msg ack = MSG_UNKNOWN;
+                    out >> ack;
+                    if (ack != AUTHENTICATED) return;
+                }
+                if (mode == QStringLiteral("fail-then-success")) {
+                    QTimer::singleShot(50, &app, [&] {
+                        SafeDataStream late(&socket);
+                        late << AUTHENTICATED << arg(QStringLiteral("--user"));
+                        late.send();
+                        late.receive();
+                        Msg msg = MSG_UNKNOWN;
+                        bool approved = false;
+                        late >> msg;
+                        if (parallel) late >> approved;
+                        else approved = msg == AUTHENTICATED;
+                        if (approved) {
+                            QFile f(proof);
+                            if (f.open(QIODevice::WriteOnly)) f.write("approved");
+                        }
+                        app.exit(1);
+                    });
+                    return;
+                }
+                if (mode.startsWith(QStringLiteral("fail-disconnect"))) {
+                    if (mode == QStringLiteral("fail-disconnect-partial")) {
+                        socket.write("x", 1);
+                        socket.flush();
+                    }
+                    socket.disconnectFromServer();
+                }
+                if (mode.endsWith(QStringLiteral("crash")))
+                    QTimer::singleShot(50, &app, [] { std::raise(SIGKILL); });
+                else if (mode.endsWith(QStringLiteral("hang")))
+                    QTimer::singleShot(9000, &app, [&] { app.exit(1); });
+                else if (mode == QStringLiteral("fail-disconnect-success-exit"))
+                    QTimer::singleShot(100, &app, [&] { app.exit(0); });
+                else if (mode == QStringLiteral("fail-disconnect") || mode == QStringLiteral("fail-disconnect-partial"))
+                    QTimer::singleShot(500, &app, [&] { app.exit(1); });
+                else
+                    app.exit(1);
                 return;
             }
             out.receive();

@@ -59,6 +59,15 @@ class ParallelAuthTest : public QObject {
         password.stop();
         fingerprint.stop();
     }
+    static void channel(Auth &auth, const QString &kind) {
+        if (kind == QStringLiteral("fingerprint")) auth.setFingerprint(true);
+        else if (kind == QStringLiteral("password")) auth.setPasswordOnly(true);
+    }
+    static void channels() {
+        QTest::addColumn<QString>("kind");
+        for (const QString &kind : {QStringLiteral("fingerprint"), QStringLiteral("password"), QStringLiteral("legacy")})
+            QTest::newRow(qPrintable(kind)) << kind;
+    }
   private slots:
     void init() {
 #if SDDM_TRUSTED_HELPER_PID && defined(SDDM_EMBEDDED_PARALLEL_HELPER)
@@ -78,6 +87,140 @@ class ParallelAuthTest : public QObject {
     }
     void failedPasswordLeavesFingerprintAvailable() {
         race(100, 700, true);
+    }
+    void reportedFailureDisconnectExitsNormally_data() { channels(); }
+    void reportedFailureDisconnectExitsNormally() {
+        QFETCH(QString, kind);
+        QTemporaryDir dir;
+        Auth a;
+        channel(a, kind);
+        setup(a, dir.filePath(QStringLiteral("proof")), 50, QStringLiteral("fail-disconnect"));
+        QSignalSpy auth(&a, &Auth::authentication), errors(&a, &Auth::error), finished(&a, &Auth::finished);
+        a.start();
+        QTRY_COMPARE_WITH_TIMEOUT(finished.size(), 1, 4000);
+        QCOMPARE(auth.size(), 1);
+        QCOMPARE(auth.first().at(1).toBool(), false);
+        QCOMPARE(errors.size(), 0);
+        QCOMPARE(finished.first().first().value<Auth::HelperExitStatus>(), Auth::HELPER_AUTH_ERROR);
+        QVERIFY(!QFile::exists(dir.filePath(QStringLiteral("proof"))));
+    }
+    void realCrashAfterFailureStaysInternal_data() {
+        QTest::addColumn<QString>("kind");
+        QTest::addColumn<QString>("mode");
+        for (const QString &kind : {QStringLiteral("fingerprint"), QStringLiteral("password"), QStringLiteral("legacy")})
+            for (const QString &mode : {QStringLiteral("fail-crash"), QStringLiteral("fail-disconnect-crash")})
+                QTest::newRow(qPrintable(kind + mode)) << kind << mode;
+    }
+    void realCrashAfterFailureStaysInternal() {
+        QFETCH(QString, kind);
+        QFETCH(QString, mode);
+        QTemporaryDir dir;
+        Auth a;
+        channel(a, kind);
+        setup(a, dir.filePath(QStringLiteral("proof")), 30, mode);
+        QSignalSpy auth(&a, &Auth::authentication), errors(&a, &Auth::error), finished(&a, &Auth::finished);
+        a.start();
+        QTRY_COMPARE_WITH_TIMEOUT(finished.size(), 1, 3000);
+        QCOMPARE(auth.size(), 1);
+        QCOMPARE(auth.first().at(1).toBool(), false);
+        QCOMPARE(errors.size(), 1);
+        QCOMPARE(errors.first().at(1).value<Auth::Error>(), Auth::ERROR_INTERNAL);
+        QCOMPARE(finished.first().first().value<Auth::HelperExitStatus>(), Auth::HELPER_OTHER_ERROR);
+        QVERIFY(!QFile::exists(dir.filePath(QStringLiteral("proof"))));
+    }
+    void failedHelperCannotRemainAlive_data() {
+        QTest::addColumn<QString>("kind");
+        QTest::addColumn<QString>("mode");
+        for (const QString &kind : {QStringLiteral("fingerprint"), QStringLiteral("password"), QStringLiteral("legacy")})
+            for (const QString &mode : {QStringLiteral("fail-hang"), QStringLiteral("fail-disconnect-hang")})
+                QTest::newRow(qPrintable(kind + mode)) << kind << mode;
+    }
+    void failedHelperCannotRemainAlive() {
+        QFETCH(QString, kind);
+        QFETCH(QString, mode);
+        QTemporaryDir dir;
+        Auth a;
+        channel(a, kind);
+        setup(a, dir.filePath(QStringLiteral("proof")), 30, mode);
+        QSignalSpy auth(&a, &Auth::authentication), errors(&a, &Auth::error), finished(&a, &Auth::finished);
+        QElapsedTimer elapsed;
+        elapsed.start();
+        a.start();
+        QTRY_COMPARE_WITH_TIMEOUT(finished.size(), 1, 3000);
+        QVERIFY(elapsed.elapsed() < 2500);
+        QCOMPARE(auth.size(), 1);
+        QCOMPARE(auth.first().at(1).toBool(), false);
+        QCOMPARE(errors.size(), 1);
+        QVERIFY(errors.first().first().toString().contains(QStringLiteral("did not finish")));
+        QCOMPARE(finished.first().first().value<Auth::HelperExitStatus>(), Auth::HELPER_OTHER_ERROR);
+        QVERIFY(!QFile::exists(dir.filePath(QStringLiteral("proof"))));
+    }
+    void newAttemptHasNoFailedExitTimer_data() { channels(); }
+    void newAttemptHasNoFailedExitTimer() {
+        QFETCH(QString, kind);
+        QTemporaryDir dir;
+        Auth a;
+        channel(a, kind);
+        const QString proof = dir.filePath(QStringLiteral("proof"));
+        setup(a, proof, 30, QStringLiteral("fail-disconnect"));
+        QSignalSpy errors(&a, &Auth::error), finished(&a, &Auth::finished);
+        a.start();
+        QTRY_COMPARE_WITH_TIMEOUT(finished.size(), 1, 3000);
+        setup(a, proof, 1300);
+        connect(&a, &Auth::authentication, &a, [&](const QString &, bool success) { a.setSessionApproved(success); });
+        a.start();
+        QTRY_COMPARE_WITH_TIMEOUT(contents(proof), QByteArray("approved"), 3000);
+        QTest::qWait(1100);
+        QVERIFY(a.isActive());
+        QCOMPARE(errors.size(), 0);
+        a.stop();
+    }
+    void failedPeerCannotSendAnotherResult_data() {
+        QTest::addColumn<QString>("kind");
+        QTest::addColumn<QString>("mode");
+        for (const QString &kind : {QStringLiteral("fingerprint"), QStringLiteral("password"), QStringLiteral("legacy")})
+            for (const QString &mode : {QStringLiteral("fail-then-success"), QStringLiteral("fail-disconnect-partial"), QStringLiteral("fail-disconnect-success-exit")})
+                QTest::newRow(qPrintable(kind + mode)) << kind << mode;
+    }
+    void failedPeerCannotSendAnotherResult() {
+        QFETCH(QString, kind);
+        QFETCH(QString, mode);
+        QTemporaryDir dir;
+        Auth a;
+        channel(a, kind);
+        const QString proof = dir.filePath(QStringLiteral("proof"));
+        setup(a, proof, 30, mode);
+        connect(&a, &Auth::authentication, &a, [&](const QString &, bool success) { a.setSessionApproved(success); });
+        QSignalSpy auth(&a, &Auth::authentication), errors(&a, &Auth::error), finished(&a, &Auth::finished);
+        a.start();
+        QTRY_COMPARE_WITH_TIMEOUT(finished.size(), 1, 3000);
+        QCOMPARE(auth.size(), 1);
+        QCOMPARE(auth.first().at(1).toBool(), false);
+        QCOMPARE(errors.size(), 1);
+        QCOMPARE(errors.first().at(1).value<Auth::Error>(), Auth::ERROR_INTERNAL);
+        QCOMPARE(finished.first().first().value<Auth::HelperExitStatus>(), Auth::HELPER_OTHER_ERROR);
+        QVERIFY(!QFile::exists(proof));
+    }
+    void passwordCanWinDuringFailedFingerprintCleanup() {
+        QTemporaryDir dir;
+        Auth fingerprint, password;
+        fingerprint.setFingerprint(true);
+        password.setPasswordOnly(true);
+        setup(fingerprint, dir.filePath(QStringLiteral("fingerprint")), 30, QStringLiteral("fail-disconnect"));
+        setup(password, dir.filePath(QStringLiteral("password")), 50);
+        QSignalSpy failed(&fingerprint, &Auth::authentication), errors(&fingerprint, &Auth::error);
+        connect(&password, &Auth::authentication, &password, [&](const QString &, bool success) {
+            password.setSessionApproved(success);
+            if (success) fingerprint.cancelAuthentication();
+        });
+        fingerprint.start();
+        QTRY_COMPARE_WITH_TIMEOUT(failed.size(), 1, 3000);
+        password.start();
+        QTRY_COMPARE_WITH_TIMEOUT(contents(dir.filePath(QStringLiteral("password"))), QByteArray("approved"), 3000);
+        QTRY_VERIFY_WITH_TIMEOUT(!fingerprint.isActive(), 2500);
+        QCOMPARE(errors.size(), 0);
+        QVERIFY(!QFile::exists(dir.filePath(QStringLiteral("fingerprint"))));
+        password.stop();
     }
     void deniedApprovalIsDeliveredToHelper() {
         QTemporaryDir dir;

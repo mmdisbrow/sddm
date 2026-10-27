@@ -334,6 +334,9 @@ namespace SDDM {
         bool parallelStarted { false };
         bool handshakeComplete { false };
         bool legacyAuthResolved { false };
+        bool failureReported { false };
+        bool failureExitTimedOut { false };
+        QString failureProtocolError;
         bool legacyFinishing { false };
         int savedExitCode { 0 };
         QProcess::ExitStatus savedExitStatus { QProcess::NormalExit };
@@ -341,6 +344,7 @@ namespace SDDM {
         QTimer handshakeTimer;
         QTimer frameTimer;
         QTimer legacyDrainTimer;
+        QTimer failureExitTimer;
         int parallelImageFd { -1 };
         int childPidFd { -1 };
         QProcessEnvironment environment { };
@@ -518,6 +522,17 @@ namespace SDDM {
             legacyFinishing = false;
             finishChildExit(savedExitCode, savedExitStatus);
         });
+        // A failed helper can close its socket before QProcess observes its
+        // normal exit. Let that exit complete instead of killing it as a crash.
+        // A reported failure is terminal and must not leave a stuck helper.
+        failureExitTimer.setSingleShot(true);
+        failureExitTimer.setInterval(1000);
+        connect(&failureExitTimer, &QTimer::timeout, this, [this] {
+            if (!cancelled && !sessionReleased && child->state() != QProcess::NotRunning) {
+                failureExitTimedOut = true;
+                child->kill();
+            }
+        });
         handshakeTimer.setSingleShot(true);
         handshakeTimer.setInterval(5000);
         connect(&handshakeTimer, &QTimer::timeout, this, [this] {
@@ -592,12 +607,19 @@ namespace SDDM {
         connect(socket, &QLocalSocket::disconnected, this, [this, socket] {
             QPointer<Private> self(this);
             QPointer<QLocalSocket> peer(socket);
-            if (legacyFinishing && socket->bytesAvailable() > 0) dataPending();
-            if (!self || !peer) return;
-            if (this->socket == socket) this->socket = nullptr;
+            if (socket->bytesAvailable() > 0) dataPending();
+            if (!self || !peer || this->socket != socket) return;
+            const bool incompleteFrame = frameTimer.isActive() || socket->bytesAvailable() > 0;
+            this->socket = nullptr;
             frameTimer.stop();
             socket->deleteLater();
-            if (!sessionReleased && child->state() != QProcess::NotRunning) child->kill();
+            if (!sessionReleased && child->state() != QProcess::NotRunning) {
+                if (failureReported && !cancelled && !incompleteFrame) {
+                    if (!failureExitTimer.isActive()) failureExitTimer.start();
+                } else {
+                    child->kill();
+                }
+            }
         });
     }
 
@@ -661,6 +683,11 @@ namespace SDDM {
                     QString user;
                     str >> user;
                     if (str.status() != QDataStream::Ok) { child->kill(); return; }
+                    if (failureReported) {
+                        failureProtocolError = Auth::tr("Authentication helper sent another result after reporting failure");
+                        child->kill();
+                        return;
+                    }
                     if (!user.isEmpty()) {
                         // A launcher that already exited may have left a
                         // detached legacy child. Never release its session.
@@ -704,14 +731,24 @@ namespace SDDM {
                         }
                     }
                     else {
+                        failureReported = true;
+                        if (!cancelled && !sessionReleased && child->state() != QProcess::NotRunning)
+                            failureExitTimer.start();
 #if SDDM_TRUSTED_HELPER_PID && defined(SDDM_EMBEDDED_PARALLEL_HELPER)
-                        if (!parallelStarted && !greeter) {
+                        if (!parallelStarted && !greeter)
                             legacyAuthResolved = true;
-                        }
 #endif
                         if (!cancelled)
                             Q_EMIT auth->authentication(user, false);
                         if (!valid()) return;
+                        if (fingerprint || passwordOnly) {
+                            // This only acknowledges receipt of a failure. It
+                            // carries no session approval or environment.
+                            SafeDataStream reply(peer);
+                            reply << AUTHENTICATED;
+                            reply.send();
+                            if (!valid()) return;
+                        }
                     }
                     break;
                 }
@@ -769,6 +806,7 @@ namespace SDDM {
         cancelTimer.stop();
         handshakeTimer.stop();
         frameTimer.stop();
+        failureExitTimer.stop();
         if (parallelImageFd >= 0) { close(parallelImageFd); parallelImageFd = -1; }
         if (childPidFd >= 0) { close(childPidFd); childPidFd = -1; }
         if (socket) {
@@ -783,15 +821,27 @@ namespace SDDM {
 #endif
                 finishedSocket->deleteLater();
         }
+        QPointer<Auth> auth(qobject_cast<Auth*>(parent()));
         if (cancelled) {
-            Q_EMIT qobject_cast<Auth*>(parent())->finished(HELPER_AUTH_ERROR);
+            Q_EMIT auth->finished(HELPER_AUTH_ERROR);
             return;
         }
-        if (exitStatus != QProcess::NormalExit) {
-            qWarning("Auth: sddm-helper (%s) crashed (exit code %d)",
-                     qPrintable(child->arguments().join(QLatin1Char(' '))),
-                     HelperExitStatus(exitStatus));
-            Q_EMIT qobject_cast<Auth*>(parent())->error(child->errorString(), ERROR_INTERNAL);
+        QString internalError;
+        if (!failureProtocolError.isEmpty()) {
+            internalError = failureProtocolError;
+        } else if (failureExitTimedOut) {
+            internalError = Auth::tr("Authentication helper did not finish after reporting failure");
+        } else if (exitStatus != QProcess::NormalExit) {
+            qWarning("Auth: sddm-helper (%s) crashed",
+                     qPrintable(child->arguments().join(QLatin1Char(' '))));
+            internalError = child->errorString();
+        } else if (failureReported && exitCode != HELPER_AUTH_ERROR) {
+            internalError = Auth::tr("Authentication helper returned an unexpected exit code after reporting failure");
+        }
+        if (!internalError.isEmpty()) {
+            Q_EMIT auth->error(internalError, ERROR_INTERNAL);
+            if (auth) Q_EMIT auth->finished(HELPER_OTHER_ERROR);
+            return;
         }
 
         if (exitCode == HELPER_SUCCESS)
@@ -799,8 +849,7 @@ namespace SDDM {
         else
             qWarning("Auth: sddm-helper exited with %d", exitCode);
 
-        Q_EMIT qobject_cast<Auth*>(parent())->finished(exitStatus == QProcess::NormalExit
-            ? static_cast<Auth::HelperExitStatus>(exitCode) : HELPER_OTHER_ERROR);
+        Q_EMIT auth->finished(static_cast<Auth::HelperExitStatus>(exitCode));
     }
 
     void Auth::Private::childError(QProcess::ProcessError error) {
@@ -808,6 +857,7 @@ namespace SDDM {
             handshakeTimer.stop();
             frameTimer.stop();
             cancelTimer.stop();
+            failureExitTimer.stop();
 #if SDDM_TRUSTED_HELPER_PID && defined(SDDM_EMBEDDED_PARALLEL_HELPER)
             if (parallelStarted || (!greeter && !legacyAuthResolved)) disableParallelRuntime();
             legacyAttemptFinished(qobject_cast<Auth *>(parent()));
@@ -818,7 +868,10 @@ namespace SDDM {
             Q_EMIT qobject_cast<Auth*>(parent())->finished(cancelled ? HELPER_AUTH_ERROR : HELPER_OTHER_ERROR);
             return;
         }
-        if (!cancelled) Q_EMIT qobject_cast<Auth*>(parent())->error(child->errorString(), ERROR_INTERNAL);
+        // Crashed is reported once from finished(), where the exit status and
+        // the bounded failed-helper cleanup outcome are both available.
+        if (!cancelled && error != QProcess::Crashed)
+            Q_EMIT qobject_cast<Auth*>(parent())->error(child->errorString(), ERROR_INTERNAL);
     }
 
     void Auth::Private::requestFinished() {
@@ -961,6 +1014,8 @@ namespace SDDM {
     bool Auth::fingerprint() const { return d->fingerprint; }
     bool Auth::parallelAttempt() const { return d->parallelStarted; }
 
+    bool Auth::cancelled() const { return d->cancelled; }
+
     void Auth::setFingerprint(bool enabled) { d->fingerprint = enabled; }
 
     void Auth::setPasswordOnly(bool enabled) { d->passwordOnly = enabled; }
@@ -971,6 +1026,7 @@ namespace SDDM {
         // Never terminate an established session through the auth-only API.
         if (d->sessionReleased) return;
         d->cancelled = true;
+        d->failureExitTimer.stop();
         d->sessionApproved = false;
 #if SDDM_TRUSTED_HELPER_PID && defined(SDDM_EMBEDDED_PARALLEL_HELPER)
         if (!d->parallelStarted && !d->greeter) {
@@ -1020,6 +1076,10 @@ namespace SDDM {
         d->parallelStarted = d->fingerprint || d->passwordOnly;
         d->handshakeComplete = false;
         d->legacyAuthResolved = false;
+        d->failureReported = false;
+        d->failureExitTimedOut = false;
+        d->failureProtocolError.clear();
+        d->failureExitTimer.stop();
         d->legacyFinishing = false;
 #if SDDM_TRUSTED_HELPER_PID && defined(SDDM_EMBEDDED_PARALLEL_HELPER)
         if (d->parallelStarted) {
@@ -1081,6 +1141,7 @@ namespace SDDM {
     }
 
     void Auth::stop() {
+        d->failureExitTimer.stop();
         if (d->child->state() == QProcess::NotRunning) {
             return;
         }

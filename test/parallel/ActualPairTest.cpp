@@ -40,6 +40,32 @@ class ActualPairTest : public QObject {
     void oldLegacyLogin() { trial(false); }
     void oldOrWrapperIsNotUsedForParallel() { trial(true); }
     void approvedParallelUsesCurrentEmbeddedHelper() { trial(true, true); }
+    void currentHelperPamDenialIsNotACrash_data() {
+        QTest::addColumn<bool>("fingerprint");
+        QTest::newRow("password") << false;
+        QTest::newRow("fingerprint") << true;
+    }
+    void currentHelperPamDenialIsNotACrash() {
+        QFETCH(bool, fingerprint);
+        QTRY_VERIFY_WITH_TIMEOUT(parallelRuntimeAvailable(), 4000);
+        const QString proof = qEnvironmentVariable("PAIR_FIXTURE") + QStringLiteral("/session-opened");
+        QFile::remove(proof);
+        Auth auth;
+        auth.setUser(QStringLiteral("root"));
+        auth.setSession(QStringLiteral("/usr/bin/true"));
+        auth.setFingerprint(fingerprint);
+        auth.setPasswordOnly(!fingerprint);
+        QSignalSpy results(&auth, &Auth::authentication), errors(&auth, &Auth::error), finished(&auth, &Auth::finished);
+        auth.start();
+        QTRY_COMPARE_WITH_TIMEOUT(finished.size(), 1, 5000);
+        QCOMPARE(results.size(), 1);
+        QCOMPARE(results.first().at(1).toBool(), false);
+        for (const auto &error : errors)
+            QVERIFY(error.at(1).value<Auth::Error>() != Auth::ERROR_INTERNAL);
+        QCOMPARE(finished.first().first().value<Auth::HelperExitStatus>(), Auth::HELPER_AUTH_ERROR);
+        QVERIFY(!QFile::exists(proof));
+        QVERIFY(parallelRuntimeAvailable());
+    }
     void failedLegacyAllowsParallel() {
         QVERIFY(!parallelRuntimeAvailable());
         Auth auth;

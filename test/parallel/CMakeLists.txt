@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.20)
 project(ParallelAuthTests LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_AUTOMOC ON)
+set(PAM_FINGERPRINT_SERVICE "sddm-fingerprint" CACHE STRING "Fingerprint PAM service under test")
 find_package(Qt6 REQUIRED COMPONENTS Core Network Qml Test DBus)
 get_filename_component(SOURCE "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
 set(SDDM_NATIVE_BUILD "" CACHE PATH "Completed native SDDM build with helper and generated daemon interfaces")
@@ -87,3 +88,8 @@ add_dependencies(DisplayLifecycleTest FakeAuthHelper)
 add_test(NAME DisplayLifecycle COMMAND /usr/bin/dbus-run-session -- /bin/bash ${CMAKE_SOURCE_DIR}/run-display-test.sh $<TARGET_FILE:DisplayLifecycleTest>)
 
 set_tests_properties(DisplayLifecycle PROPERTIES TIMEOUT 90)
+
+# Isolated real-helper test of the opt-in private PAM readiness signal.
+add_executable(ReadyHelperTest ReadyHelperTest.cpp ${SOURCE}/src/common/SafeDataStream.cpp)
+target_include_directories(ReadyHelperTest PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/include ${SOURCE}/src/auth ${SOURCE}/src/common)
+target_link_libraries(ReadyHelperTest PRIVATE Qt6::Core Qt6::Network Qt6::Qml Qt6::Test)

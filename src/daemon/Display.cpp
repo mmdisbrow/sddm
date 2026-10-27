@@ -427,8 +427,7 @@ namespace SDDM {
             m_fingerprintRetry.start();
             return;
         }
-        m_socketServer->fingerprintActive(m_socket, true);
-    }
+        }
 
     QString Display::findGreeterTheme() const {
         QString themeName = mainConfig.Theme.Current.get();
@@ -645,6 +644,15 @@ namespace SDDM {
     }
 
     void Display::slotAuthInfo(const QString &message, Auth::Info info) {
+        // An opt-in PAM notification is sent only after VerifyStart succeeds.
+        if (message == QStringLiteral("\036FPRINTD_VERIFY_READY_V1")) {
+            Auth *auth = qobject_cast<Auth *>(sender());
+            if (auth == m_fingerprintAuth && auth->parallelAttempt() && auth->isActive() &&
+                !auth->cancelled() && !m_selection.user().isEmpty() &&
+                auth->user() == m_selection.user() && !m_stopping && !m_selection.winner() && m_socket)
+                m_socketServer->fingerprintActive(m_socket, true);
+            return;
+        }
         qWarning() << "Authentication information:" << info << message;
 
         if (!m_socket)

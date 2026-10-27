@@ -51,6 +51,13 @@ with tempfile.TemporaryDirectory(prefix='v6-actual-pair-') as temp:
                    'fixture', str(build / 'ActualPairTest'), test]
         subprocess.run(command, check=True, timeout=35)
     shutil.copy2(old, path)
+    print('current embedded helper: PAM denial preserves normal failure and capability', flush=True)
+    for name in ('sddm-password', 'sddm-fingerprint'):
+        (fixture / 'pam' / name).write_text('auth required pam_deny.so\naccount required pam_permit.so\nsession required pam_exec.so /usr/bin/touch /tmp/fixture/session-opened\n')
+    for _ in range(10):
+        run('currentHelperPamDenialIsNotACrash')
+    for name in ('sddm-password', 'sddm-fingerprint'):
+        (fixture / 'pam' / name).write_text(policy)
     print('direct upstream helper: legacy framing', flush=True)
     run('oldLegacyLogin')
     print('direct upstream helper: cancellation during success callback', flush=True)

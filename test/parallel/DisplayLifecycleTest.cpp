@@ -280,6 +280,29 @@ class DisplayLifecycleTest : public QObject {
         QTRY_COMPARE(contents(proof + "-fp"), QByteArray("approved"));
         d.stop();
     }
+    void failedLegacyDisconnectKeepsDisplayForFingerprintRetry() {
+        testParallelFailure(16);
+        QVERIFY(!parallelFingerprintEnabled());
+        prepare(800, 50, "password-fail-disconnect");
+        Seat seat("seat-fixture");
+        Display d(&seat, Display::WaylandDisplayServerType);
+        QVERIFY(d.start());
+        SocketPair sockets;
+        Auth *legacy = nullptr;
+        for (auto *auth : d.findChildren<Auth *>()) if (!auth->fingerprint()) legacy = auth;
+        QVERIFY(legacy);
+        QSignalSpy errors(legacy, &Auth::error);
+        QSignalSpy success(&d, &Display::loginSucceeded), failure(&d, &Display::loginFailed), stopped(&d, &Display::stopped);
+        d.login(sockets.peer, "fixture", "synthetic", session);
+        QTRY_VERIFY_WITH_TIMEOUT(failure.size() >= 1, 4000);
+        QTRY_VERIFY_WITH_TIMEOUT(parallelFingerprintEnabled(), 4000);
+        QCOMPARE(stopped.size(), 0);
+        QCOMPARE(errors.size(), 0);
+        d.startFingerprint(sockets.peer, "fixture", session);
+        QTRY_COMPARE_WITH_TIMEOUT(success.size(), 1, 4000);
+        QTRY_COMPARE(contents(proof + "-fp"), QByteArray("approved"));
+        d.stop();
+    }
     void negotiatedGreeterReceivesReadyAfterLegacyFailure() {
         testParallelFailure(16);
         QVERIFY(!parallelFingerprintEnabled());
@@ -465,6 +488,45 @@ class DisplayLifecycleTest : public QObject {
     }
     void fingerprintWinRetainsSessionUntilWinningHelperExits() {
         race(true);
+    }
+    void indicatorWaitsForVerifiedReaderAndRejectsStaleSignals() {
+        prepare(100, 4000);
+        Seat seat("seat-fixture");
+        Display d(&seat, Display::WaylandDisplayServerType);
+        QVERIFY(d.start());
+        SocketPair sockets;
+        d.startFingerprint(sockets.peer, "fixture", session);
+        Auth *finger = nullptr, *password = nullptr;
+        for (auto *auth : d.findChildren<Auth *>()) {
+            if (auth->fingerprint()) finger = auth; else password = auth;
+        }
+        QVERIFY(finger); QVERIFY(password); QVERIFY(finger->isActive());
+        QTest::qWait(150);
+        QCOMPARE(sockets.client.bytesAvailable(), qint64(0));
+        const auto marker = QStringLiteral("\036FPRINTD_VERIFY_READY_V1");
+        emit password->info(marker, Auth::INFO_UNKNOWN);
+        QTest::qWait(30);
+        QCOMPARE(sockets.client.bytesAvailable(), qint64(0));
+        emit finger->info(marker, Auth::INFO_UNKNOWN);
+        QTRY_VERIFY(sockets.client.bytesAvailable() >= 5);
+        QDataStream input(&sockets.client);
+        LoginReply reply;
+        QVERIFY(readLoginReply(input, reply));
+        QCOMPARE(reply.kind, DaemonMessages::FingerprintActive);
+        QVERIFY(reply.active);
+        d.startFingerprint(sockets.peer, QString(), session);
+        QTRY_VERIFY(sockets.client.bytesAvailable() >= 5);
+        QVERIFY(readLoginReply(input, reply));
+        QCOMPARE(reply.kind, DaemonMessages::FingerprintActive);
+        QVERIFY(!reply.active);
+        emit finger->info(marker, Auth::INFO_UNKNOWN);
+        QTest::qWait(100);
+        while (sockets.client.bytesAvailable()) {
+            QVERIFY(readLoginReply(input, reply));
+            QCOMPARE(reply.kind, DaemonMessages::FingerprintActive);
+            QVERIFY(!reply.active);
+        }
+        d.stop();
     }
     void lateReaderStartKeepsPasswordAlive() {
         race(false, true);
