@@ -223,6 +223,10 @@ namespace SDDM {
             service = QStringLiteral("sddm-greeter");
         else if (m_autologin)
             service = QStringLiteral("sddm-autologin");
+        else if (m_fingerprint)
+            service = QStringLiteral("sddm-fingerprint");
+        else if (m_passwordOnly)
+            service = QStringLiteral("sddm-password");
         result = m_pam->start(service, user);
 
         if (!result)
